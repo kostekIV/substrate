@@ -273,10 +273,14 @@ pub struct BlockImportNotification<Block: BlockT> {
 /// Summary of a finalized block.
 #[derive(Clone, Debug)]
 pub struct FinalityNotification<Block: BlockT> {
-	/// Imported block header hash.
+	/// Finalized block header hash.
 	pub hash: Block::Hash,
-	/// Imported block header.
+	/// Finalized block header.
 	pub header: Block::Header,
+	/// Previous explicitly finalized block header hash.
+	pub previous_finalized_hash: Block::Hash,
+	/// List of hashes for stale branches heads.
+	pub stale_heads: Vec<Block::Hash>,
 }
 
 impl<B: BlockT> TryFrom<BlockImportNotification<B>> for ChainEvent<B> {

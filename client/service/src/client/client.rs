@@ -30,8 +30,8 @@ use rand::Rng;
 use sc_block_builder::{BlockBuilderApi, BlockBuilderProvider, RecordProof};
 use sc_client_api::{
 	backend::{
-		self, apply_aux, BlockImportOperation, ClientImportOperation, Finalizer, ImportSummary,
-		LockImportRun, NewBlockState, StorageProvider,
+		self, apply_aux, BlockImportOperation, ClientImportOperation, FinalizeSummary, Finalizer,
+		ImportSummary, LockImportRun, NewBlockState, StorageProvider,
 	},
 	client::{
 		BadBlocks, BlockBackend, BlockImportNotification, BlockOf, BlockchainEvents, ClientInfo,
@@ -274,7 +274,7 @@ where
 			let mut op = ClientImportOperation {
 				op: self.backend.begin_operation()?,
 				notify_imported: None,
-				notify_finalized: Vec::new(),
+				notify_finalized: None,
 			};
 
 			let r = f(&mut op)?;
@@ -622,16 +622,25 @@ where
 						None
 					},
 				};
-				// Ensure parent chain is finalized to maintain invariant that
-				// finality is called sequentially. This will also send finality
-				// notifications for top 250 newly finalized blocks.
+				// >>> TODO: REMOVE THIS BEFORE MERGE       <<<
+				// >>> IS THE FOLLOWING STILL NECESSARY ??? <<<
+				//
+				// THE FOLLOWING ASSUMPTION ABOUT FINALITY NOTIFICATIONS DOESN'T APPLY ANYMORE.
+				// NOW WE EXPLICITLY NOTIFY SUBSCRIBERS ONLY ABOUT "FINALIZATION CHECKPOINTS".
+				//
+				// > Ensure parent chain is finalized to maintain invariant that
+				// > finality is called sequentially. This will also send finality
+				// > notifications for top 250 newly finalized blocks.
 				if finalized && parent_exists {
 					self.apply_finality_with_block_hash(
 						operation,
 						parent_hash,
 						None,
 						info.best_hash,
-						make_notifications,
+						// TODO: REMOVE THIS COMMENT
+						// We set `notify` to false since we only want to send out notifications
+						// about THIS block and not for the parent.
+						false,
 					)?;
 				}
 
@@ -687,7 +696,10 @@ where
 		// or if this import triggers a re-org
 		if make_notifications || tree_route.is_some() {
 			if finalized {
-				operation.notify_finalized.push(hash);
+				operation.notify_finalized = Some(FinalizeSummary {
+					hash,
+					previous_hash: self.backend.blockchain().last_finalized()?,
+				});
 			}
 
 			operation.notify_imported = Some(ImportSummary {
@@ -831,58 +843,59 @@ where
 		operation.op.mark_finalized(BlockId::Hash(block), justification)?;
 
 		if notify {
-			// sometimes when syncing, tons of blocks can be finalized at once.
-			// we'll send notifications spuriously in that case.
-			const MAX_TO_NOTIFY: usize = 256;
-			let enacted = route_from_finalized.enacted();
-			let start = enacted.len() - std::cmp::min(enacted.len(), MAX_TO_NOTIFY);
-			for finalized in &enacted[start..] {
-				operation.notify_finalized.push(finalized.hash);
-			}
+			operation.notify_finalized =
+				Some(FinalizeSummary { hash: block, previous_hash: last_finalized });
 		}
 
 		Ok(())
 	}
 
-	fn notify_finalized(&self, notify_finalized: Vec<Block::Hash>) -> sp_blockchain::Result<()> {
+	fn notify_finalized(
+		&self,
+		notify_finalized: Option<FinalizeSummary<Block>>,
+	) -> sp_blockchain::Result<()> {
 		let mut sinks = self.finality_notification_sinks.lock();
 
-		if notify_finalized.is_empty() {
-			// cleanup any closed finality notification sinks
-			// since we won't be running the loop below which
-			// would also remove any closed sinks.
-			sinks.retain(|sink| !sink.is_closed());
+		let notify_finalized = match notify_finalized {
+			Some(notify_finalized) => notify_finalized,
+			None => {
+				// cleanup any closed finality notification sinks
+				// since we won't be running the loop below which
+				// would also remove any closed sinks.
+				sinks.retain(|sink| !sink.is_closed());
+				return Ok(())
+			},
+		};
 
-			return Ok(())
-		}
+		let header = self.header(&BlockId::Hash(notify_finalized.hash))?.expect(
+			"Header already known to exist in DB because it is indicated in the tree route; \
+				qed",
+		);
 
-		// We assume the list is sorted and only want to inform the
-		// telemetry once about the finalized block.
-		if let Some(last) = notify_finalized.last() {
-			let header = self.header(&BlockId::Hash(*last))?.expect(
-				"Header already known to exist in DB because it is indicated in the tree route; \
-				 qed",
-			);
+		telemetry!(
+			self.telemetry;
+			SUBSTRATE_INFO;
+			"notify.finalized";
+			"height" => format!("{}", header.number()),
+			"best" => ?notify_finalized.hash,
+		);
 
-			telemetry!(
-				self.telemetry;
-				SUBSTRATE_INFO;
-				"notify.finalized";
-				"height" => format!("{}", header.number()),
-				"best" => ?last,
-			);
-		}
+		let mut stale_heads = self.backend.blockchain().leaves()?;
+		stale_heads.retain(|block| {
+			let route_from_finalized =
+				sp_blockchain::tree_route(self.backend.blockchain(), notify_finalized.hash, *block)
+					.unwrap();
+			!route_from_finalized.retracted().is_empty()
+		});
 
-		for finalized_hash in notify_finalized {
-			let header = self.header(&BlockId::Hash(finalized_hash))?.expect(
-				"Header already known to exist in DB because it is indicated in the tree route; \
-				 qed",
-			);
+		let notification = FinalityNotification {
+			header,
+			hash: notify_finalized.hash,
+			previous_finalized_hash: notify_finalized.previous_hash,
+			stale_heads,
+		};
 
-			let notification = FinalityNotification { header, hash: finalized_hash };
-
-			sinks.retain(|sink| sink.unbounded_send(notification.clone()).is_ok());
-		}
+		sinks.retain(|sink| sink.unbounded_send(notification.clone()).is_ok());
 
 		Ok(())
 	}
@@ -901,7 +914,6 @@ where
 				// temporary leak of closed/discarded notification sinks (e.g.
 				// from consensus code).
 				self.import_notification_sinks.lock().retain(|sink| !sink.is_closed());
-
 				return Ok(())
 			},
 		};
